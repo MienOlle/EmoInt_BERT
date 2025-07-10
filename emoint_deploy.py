@@ -41,15 +41,6 @@ def load_nrc_hash_emo(filepath):
             lexicon[word][emotion] = float(score)
     return lexicon
 
-def tokenize_texts(texts, max_len=128):
-    return tokenizer(
-        texts.tolist(),
-        padding='max_length',
-        truncation=True,
-        max_length=max_len,
-        return_tensors='pt'
-    )
-
 def convert_emojis(text):
     text = emoji.demojize(text, delimiters=(" ", " "))
     text = re.sub(r':([a-zA-Z_]+):', r'\1', text)
@@ -111,17 +102,6 @@ def extract_hash_emo(text, lexicon):
 
     return [np.mean(scores[emo]) if scores[emo] else 0.0 for emo in emotions]
 
-def extract_all_lexicons(text):
-    vad_feats = extract_vad(text, nrc_vad_lexicon)
-    vad_feats = scaler_vad.transform([vad_feats])
-    lex_feats = extract_lex(text, nrc_lexicon)
-    lex_feats = scaler_lex.transform([lex_feats])
-    hash_feats = extract_hash_emo(text, hash_emo_lex)
-    hash_feats = scaler_hash.transform([hash_feats])
-
-    combined_feats = np.concatenate([vad_feats, lex_feats, hash_feats], axis = 1)
-    return combined_feats
-
 class EmotionMultiTaskModel(nn.Module):
     def __init__(self, num_emotions=4, lex_dim=21):
         super(EmotionMultiTaskModel, self).__init__()
@@ -160,24 +140,51 @@ class EmotionMultiTaskModel(nn.Module):
 
         return cls_probs, reg_output
     
-nrc_lexicon = load_lex("NRC-Emotion-Lexicon-Wordlevel-v0.92.txt")
-nrc_vad_lexicon = load_nrc_vad("NRC-VAD-Lexicon-v2.1.txt")
-hash_emo_lex = load_nrc_hash_emo("NRC-Hashtag-Emotion-Lexicon-v0.2.txt")
-
-scaler_lex = joblib.load("lex_scaler.pkl")
-scaler_vad = joblib.load("vad_scaler.pkl")
-scaler_hash = joblib.load("hash_scaler.pkl")
-
-tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
 emotion_cols = ["joy", "sadness", "anger", "fear"]
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-num_emotions = len(emotion_cols)
 lex_dim = 21
-model = EmotionMultiTaskModel(num_emotions=num_emotions, lex_dim=lex_dim).to(device)
-model.load_state_dict(torch.load("best_multitask_multilabel_model.pth", map_location=device))
 
-def predict_emotions(text, model, tokenizer, threshold=0.3):
+@st.cache_resource
+def load_model_tokenizer(num_emotions, lex_dim, device):
+    model = EmotionMultiTaskModel(num_emotions=num_emotions, lex_dim=lex_dim).to(device)
+    model.load_state_dict(torch.load("best_multitask_multilabel_model.pth", map_location=device))
+    model.eval()
+
+    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+    return model, tokenizer
+    
+@st.cache_resource
+def load_scalers():
+    scaler_lex = joblib.load("lex_scaler.pkl")
+    scaler_vad = joblib.load("vad_scaler.pkl")
+    scaler_hash = joblib.load("hash_scaler.pkl")
+    return scaler_lex, scaler_vad, scaler_hash
+
+def load_lexicon_data():
+    nrc_lexicon = load_lex("NRC-Emotion-Lexicon-Wordlevel-v0.92.txt")
+    nrc_vad_lexicon = load_nrc_vad("NRC-VAD-Lexicon-v2.1.txt")
+    hash_emo_lex = load_nrc_hash_emo("NRC-Hashtag-Emotion-Lexicon-v0.2.txt")
+    return nrc_lexicon, nrc_vad_lexicon, hash_emo_lex
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+num_emotions = len(emotion_cols)
+model, tokenizer = load_model_tokenizer(num_emotions, lex_dim, device)
+scaler_lex, scaler_vad, scaler_hash = load_scalers()
+nrc_lexicon, nrc_vad_lexicon, hash_emo_lex = load_lexicon_data()
+
+def extract_all_lexicons(text):
+    vad_feats = extract_vad(text, nrc_vad_lexicon)
+    vad_feats = scaler_vad.transform([vad_feats])
+
+    lex_feats = extract_lex(text, nrc_lexicon)
+    lex_feats = scaler_lex.transform([lex_feats])
+
+    hash_feats = extract_hash_emo(text, hash_emo_lex)
+    hash_feats = scaler_hash.transform([hash_feats])
+
+    combined_feats = np.concatenate([vad_feats, lex_feats, hash_feats], axis = 1)
+    return combined_feats
+
+def predict_emotions(text, model, tokenizer, device, threshold=0.3):
     model.eval()
 
     # Clean and tokenize the text
@@ -209,8 +216,6 @@ def predict_emotions(text, model, tokenizer, threshold=0.3):
         cls_probs = cls_probs.cpu().numpy()[0]
         intensities = intensities.cpu().numpy()[0]
 
-        # Apply threshold to classification probabilities
-        # detected_emotions = cls_probs > threshold
         detected_emotions = np.zeros_like(cls_probs, dtype=bool)
         detected_emotions[cls_probs.argmax()] = True
 
@@ -225,22 +230,32 @@ def predict_emotions(text, model, tokenizer, threshold=0.3):
 
     return results
 
+# STREAMLIT UI
+st.title("Emotion Intensity Prediction using Transformer Based Models")
+st.markdown("Enter text below to predict emotions and their intensities.")
 
-text = "I'm angry, but I think I can tolerate their behavior."
-result = predict_emotions(text, model, tokenizer)
-print(f"Text: {text}")
-print("Detected emotions:")
+text_input = st.text_area("Input Text:", height=150, placeholder="Type your sentence here... eg.I am very happy")
 
-# Sort emotions by intensity
-emotions_sorted = sorted(
-    [(emotion, details) for emotion, details in result.items() if details["detected"]],
-    key=lambda x: x[1]["intensity"],
-    reverse=True
-)
+if st.button("Predict Emotions"):
+    if text_input.strip() == "":
+        st.warning("Please enter some text to get predictions.")
+    else:
+        with st.spinner("Analyzing emotions..."):
+            results = predict_emotions(text_input, model, tokenizer, device)
 
-if emotions_sorted:
-    for emotion, details in emotions_sorted:
-        print(f"  {emotion}: intensity={details['intensity']:.2f}, probability={details['probability']:.2f}")
-else:
-    print("  No emotions detected")
-print("---")
+            st.subheader("Prediction Results:")
+
+            emotions_sorted = sorted(
+                [(emotion, details) for emotion, details in results.items() if details["detected"]],
+                key=lambda x: x[1]["intensity"],
+                reverse=True
+            )
+
+            if emotions_sorted:
+                st.write("---")
+                for emotion, details in emotions_sorted:
+                    st.write(f"### {emotion.capitalize()}")
+                    st.progress(details['intensity'], text = f"Intensity: {details['intensity']:.2f}")
+                    st.progress(details['probability'], text = f"Confidence Score: {details['probability']:.2f}")
+            else:
+                st.info("No emotions detected")
